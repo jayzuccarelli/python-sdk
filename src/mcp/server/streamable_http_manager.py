@@ -22,8 +22,13 @@ from mcp.server._streamable_http_modern import handle_modern_request
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser, AuthorizationContext, authorization_context
 from mcp.server.connection import Connection
 from mcp.server.runner import serve_connection, serve_loop
-from mcp.server.streamable_http import MCP_SESSION_ID_HEADER, EventStore, StreamableHTTPServerTransport
-from mcp.server.transport_security import TransportSecuritySettings
+from mcp.server.streamable_http import (
+    MCP_SESSION_ID_HEADER,
+    EventStore,
+    StreamableHTTPServerTransport,
+    validate_sessionless_request,
+)
+from mcp.server.transport_security import TransportSecurityMiddleware, TransportSecuritySettings
 from mcp.shared._compat import resync_tracer
 from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
@@ -101,6 +106,8 @@ class StreamableHTTPSessionManager:
         self.session_idle_timeout = session_idle_timeout
         self.max_request_body_size = max_request_body_size
         self.asgi_app = RequestBodyLimitMiddleware(self._handle_request, max_request_body_size)
+        # Used to refuse a request before a session exists to attach one to.
+        self._security = TransportSecurityMiddleware(security_settings)
 
         # Session tracking (only used if not stateless)
         self._session_creation_lock = anyio.Lock()
@@ -284,7 +291,19 @@ class StreamableHTTPSessionManager:
             return
 
         if request_mcp_session_id is None:
-            # New session case
+            # New session case. Refuse everything decidable from the request itself
+            # first: registering a transport starts a long-lived session task, and a
+            # request the server goes on to reject would leave that session behind
+            # with nothing to reclaim it.
+            if not await validate_sessionless_request(
+                scope,
+                receive,
+                send,
+                security=self._security,
+                is_json_response_enabled=self.json_response,
+            ):
+                return
+
             logger.debug("Creating new transport")
             async with self._session_creation_lock:
                 new_session_id = uuid4().hex

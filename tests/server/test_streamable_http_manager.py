@@ -23,6 +23,7 @@ from mcp.server.streamable_http_manager import (
     RequestBodyLimitMiddleware,
     StreamableHTTPSessionManager,
 )
+from mcp.server.transport_security import TransportSecuritySettings
 
 
 @pytest.mark.anyio
@@ -266,7 +267,7 @@ async def test_stateful_session_cleanup_on_graceful_exit(running_manager: tuple[
         "type": "http",
         "method": "POST",
         "path": "/mcp",
-        "headers": [(b"content-type", b"application/json")],
+        "headers": [(b"content-type", b"application/json"), (b"accept", b"application/json, text/event-stream")],
     }
 
     async def mock_receive():
@@ -324,7 +325,7 @@ async def test_stateful_session_cleanup_on_exception(running_manager: tuple[Stre
         "type": "http",
         "method": "POST",
         "path": "/mcp",
-        "headers": [(b"content-type", b"application/json")],
+        "headers": [(b"content-type", b"application/json"), (b"accept", b"application/json, text/event-stream")],
     }
 
     async def mock_receive():
@@ -522,7 +523,7 @@ async def test_idle_session_is_reaped(caplog: pytest.LogCaptureFixture, request:
             "type": "http",
             "method": "POST",
             "path": "/mcp",
-            "headers": [(b"content-type", b"application/json")],
+            "headers": [(b"content-type", b"application/json"), (b"accept", b"application/json, text/event-stream")],
         }
 
         async def mock_receive():
@@ -746,3 +747,83 @@ async def test_anonymous_session_accepts_anonymous_requests(
     session_id = await _open_session(manager, None)
 
     assert await _request_session(manager, session_id, None) != 404
+
+
+async def _refused_request(
+    manager: StreamableHTTPSessionManager, scope: Scope
+) -> tuple[int, dict[str, str], dict[str, StreamableHTTPServerTransport]]:
+    """Drive one request and report its status, headers, and the sessions left behind."""
+    sent_messages: list[Message] = []
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b'{"jsonrpc":"2.0","id":1,"method":"initialize"}', "more_body": False}
+
+    async def send(message: Message) -> None:
+        sent_messages.append(message)
+
+    async with manager.run():
+        await manager.handle_request(scope, receive, send)
+        # `run()` clears the registry on exit, so snapshot it while still inside.
+        instances = dict(manager._server_instances)
+
+    response_start = next(message for message in sent_messages if message["type"] == "http.response.start")
+    headers = {name.decode().lower(): value.decode() for name, value in response_start.get("headers", [])}
+    return response_start["status"], headers, instances
+
+
+ACCEPT_BOTH = b"application/json, text/event-stream"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("method", "headers", "expected_status"),
+    [
+        # POST refused for its Accept header, and for its Content-Type.
+        pytest.param("POST", [(b"content-type", b"application/json")], 406, id="post-no-accept"),
+        pytest.param("POST", [(b"content-type", b"application/json"), (b"accept", b"text/plain")], 406, id="post-406"),
+        # Refused by the transport-security layer, which checks Content-Type first.
+        pytest.param("POST", [(b"content-type", b"text/plain"), (b"accept", ACCEPT_BOTH)], 400, id="post-bad-type"),
+        # A bare probe at /mcp — a scanner or a health check — can never open a
+        # session, since a GET only resumes one that already exists.
+        pytest.param("GET", [(b"accept", b"*/*")], 400, id="get-probe"),
+        pytest.param("GET", [(b"accept", b"application/json")], 406, id="get-406"),
+        pytest.param("DELETE", [(b"accept", ACCEPT_BOTH)], 400, id="delete-no-session"),
+        pytest.param("PUT", [(b"accept", ACCEPT_BOTH)], 405, id="unsupported-method"),
+    ],
+)
+async def test_refused_request_creates_no_session(
+    method: str, headers: list[tuple[bytes, bytes]], expected_status: int
+) -> None:
+    """A request the server refuses must not leave a live session behind."""
+    manager = StreamableHTTPSessionManager(app=Server("test-refusals"))
+    scope: Scope = {"type": "http", "method": method, "path": "/mcp", "headers": headers}
+
+    status, response_headers, instances = await _refused_request(manager, scope)
+
+    assert status == expected_status
+    assert instances == {}
+    # A refused request must not hand back a session id: there is no session to
+    # go with it, and a client that reuses it would be talking to nothing.
+    assert MCP_SESSION_ID_HEADER not in response_headers
+
+
+@pytest.mark.anyio
+async def test_dns_rebinding_rejection_creates_no_session() -> None:
+    """A request blocked by DNS-rebinding protection must not create a session either."""
+    manager = StreamableHTTPSessionManager(
+        app=Server("test-dns-rebinding"),
+        security_settings=TransportSecuritySettings(
+            enable_dns_rebinding_protection=True, allowed_hosts=["example.com"]
+        ),
+    )
+    scope: Scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": [(b"content-type", b"application/json"), (b"accept", ACCEPT_BOTH), (b"host", b"evil.example")],
+    }
+
+    status, _headers, instances = await _refused_request(manager, scope)
+
+    assert status == 421
+    assert instances == {}

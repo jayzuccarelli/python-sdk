@@ -101,6 +101,129 @@ def check_accept_headers(request: Request) -> tuple[bool, bool]:
     return has_json, has_sse
 
 
+def check_content_type(request: Request) -> bool:
+    """Check if the request has the correct Content-Type."""
+    content_type = request.headers.get("content-type", "")
+    content_type_parts = [part.strip() for part in content_type.split(";")[0].split(",")]
+
+    return any(part == CONTENT_TYPE_JSON for part in content_type_parts)
+
+
+def create_error_response(
+    error_message: str,
+    status_code: HTTPStatus,
+    error_code: int = INVALID_REQUEST,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    """Create an error response with a simple string message."""
+    response_headers = {"Content-Type": CONTENT_TYPE_JSON}
+    if headers:
+        response_headers.update(headers)
+
+    error_response = JSONRPCError(
+        jsonrpc="2.0",
+        id=None,
+        error=ErrorData(code=error_code, message=error_message),
+    )
+
+    return Response(
+        error_response.model_dump_json(by_alias=True, exclude_unset=True),
+        status_code=status_code,
+        headers=response_headers,
+    )
+
+
+def post_header_refusal(
+    request: Request,
+    *,
+    is_json_response_enabled: bool,
+) -> tuple[str, HTTPStatus] | None:
+    """Return the refusal a POST's Accept/Content-Type headers earn, or None if they pass.
+
+    Split out from the request handler so the session manager can apply the same
+    rules before it mints a session; see `validate_sessionless_request`.
+    """
+    has_json, has_sse = check_accept_headers(request)
+    if is_json_response_enabled:
+        # For JSON-only responses, only require application/json
+        if not has_json:
+            return "Not Acceptable: Client must accept application/json", HTTPStatus.NOT_ACCEPTABLE
+    # For SSE responses, require both content types
+    elif not (has_json and has_sse):
+        return (
+            "Not Acceptable: Client must accept both application/json and text/event-stream",
+            HTTPStatus.NOT_ACCEPTABLE,
+        )
+
+    if not check_content_type(request):  # pragma: no cover
+        # Unreachable in practice: the transport-security layer already rejects a
+        # POST whose Content-Type is not JSON. Kept so this function remains a
+        # complete statement of what a POST's headers must satisfy.
+        return (
+            "Unsupported Media Type: Content-Type must be application/json",
+            HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+        )
+
+    return None
+
+
+async def validate_sessionless_request(
+    scope: Scope,
+    receive: Receive,
+    send: Send,
+    *,
+    security: TransportSecurityMiddleware,
+    is_json_response_enabled: bool,
+) -> bool:
+    """Apply the refusals a request earns before any session exists.
+
+    Everything decidable from the request line and headers alone lives here, so the
+    session manager can refuse a request without first registering a transport for
+    it. Returns True when the request may go on to create a session; otherwise an
+    error response has already been sent.
+
+    The responses carry no `Mcp-Session-Id`, because at this point no session has
+    been created and handing back an id the server will not honour is worse than
+    handing back none.
+    """
+    request = Request(scope, receive)
+    is_post = request.method == "POST"
+
+    error_response = await security.validate_request(request, is_post=is_post)
+    if error_response:
+        await error_response(scope, receive, send)
+        return False
+
+    if is_post:
+        refusal = post_header_refusal(request, is_json_response_enabled=is_json_response_enabled)
+        if refusal is None:
+            return True
+        message, status_code = refusal
+        response = create_error_response(message, status_code)
+    elif request.method == "GET":
+        _, has_sse = check_accept_headers(request)
+        if not has_sse:
+            response = create_error_response(
+                "Not Acceptable: Client must accept text/event-stream",
+                HTTPStatus.NOT_ACCEPTABLE,
+            )
+        else:
+            # A GET opens the standalone stream of an existing session, so without a
+            # session id it can never succeed.
+            response = create_error_response("Bad Request: Missing session ID", HTTPStatus.BAD_REQUEST)
+    elif request.method == "DELETE":
+        response = create_error_response("Bad Request: Missing session ID", HTTPStatus.BAD_REQUEST)
+    else:
+        response = create_error_response(
+            "Method Not Allowed",
+            HTTPStatus.METHOD_NOT_ALLOWED,
+            headers={"Allow": "GET, POST, DELETE"},
+        )
+
+    await response(scope, receive, send)
+    return False
+
+
 @dataclass
 class EventMessage:
     """A JSONRPCMessage with an optional event ID for stream resumability."""
@@ -371,25 +494,11 @@ class StreamableHTTPServerTransport:
         headers: dict[str, str] | None = None,
     ) -> Response:
         """Create an error response with a simple string message."""
-        response_headers = {"Content-Type": CONTENT_TYPE_JSON}
-        if headers:
-            response_headers.update(headers)
-
+        response_headers = dict(headers) if headers else {}
         if self.mcp_session_id:
             response_headers[MCP_SESSION_ID_HEADER] = self.mcp_session_id
 
-        # Return a properly formatted JSON error response
-        error_response = JSONRPCError(
-            jsonrpc="2.0",
-            id=None,
-            error=ErrorData(code=error_code, message=error_message),
-        )
-
-        return Response(
-            error_response.model_dump_json(by_alias=True, exclude_unset=True),
-            status_code=status_code,
-            headers=response_headers,
-        )
+        return create_error_response(error_message, status_code, error_code, response_headers)
 
     def _create_json_response(
         self,
@@ -485,34 +594,16 @@ class StreamableHTTPServerTransport:
         else:
             await self._handle_unsupported_request(request, send)
 
-    def _check_content_type(self, request: Request) -> bool:
-        """Check if the request has the correct Content-Type."""
-        content_type = request.headers.get("content-type", "")
-        content_type_parts = [part.strip() for part in content_type.split(";")[0].split(",")]
+    async def _validate_post_headers(self, request: Request, scope: Scope, send: Send) -> bool:
+        """Validate a POST's Accept and Content-Type headers. Returns True if valid."""
+        refusal = post_header_refusal(request, is_json_response_enabled=self.is_json_response_enabled)
+        if refusal is None:
+            return True
 
-        return any(part == CONTENT_TYPE_JSON for part in content_type_parts)
-
-    async def _validate_accept_header(self, request: Request, scope: Scope, send: Send) -> bool:
-        """Validate Accept header based on response mode. Returns True if valid."""
-        has_json, has_sse = check_accept_headers(request)
-        if self.is_json_response_enabled:
-            # For JSON-only responses, only require application/json
-            if not has_json:
-                response = self._create_error_response(
-                    "Not Acceptable: Client must accept application/json",
-                    HTTPStatus.NOT_ACCEPTABLE,
-                )
-                await response(scope, request.receive, send)
-                return False
-        # For SSE responses, require both content types
-        elif not (has_json and has_sse):
-            response = self._create_error_response(
-                "Not Acceptable: Client must accept both application/json and text/event-stream",
-                HTTPStatus.NOT_ACCEPTABLE,
-            )
-            await response(scope, request.receive, send)
-            return False
-        return True
+        error_message, status_code = refusal
+        response = self._create_error_response(error_message, status_code)
+        await response(scope, request.receive, send)
+        return False
 
     async def _handle_post_request(self, scope: Scope, request: Request, receive: Receive, send: Send) -> None:
         """Handle POST requests containing JSON-RPC messages."""
@@ -520,17 +611,8 @@ class StreamableHTTPServerTransport:
         if writer is None:  # pragma: no cover
             raise ValueError("No read stream writer available. Ensure connect() is called first.")
         try:
-            # Validate Accept header
-            if not await self._validate_accept_header(request, scope, send):
-                return
-
-            # Validate Content-Type
-            if not self._check_content_type(request):  # pragma: no cover
-                response = self._create_error_response(
-                    "Unsupported Media Type: Content-Type must be application/json",
-                    HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
-                )
-                await response(scope, receive, send)
+            # Validate Accept and Content-Type headers
+            if not await self._validate_post_headers(request, scope, send):
                 return
 
             # Parse the body - only read it once

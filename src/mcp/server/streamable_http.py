@@ -626,7 +626,11 @@ class StreamableHTTPServerTransport:
 
                 # Process the message after sending the response
                 session_message = SessionMessage(message, metadata=self._message_metadata(request))
-                await writer.send(session_message)
+                try:
+                    await writer.send(session_message)
+                except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+                    # The 202 has already completed, so there is no response left to turn into a 500.
+                    logger.debug("Session closed before the message could be delivered; dropping it")
 
                 return
 

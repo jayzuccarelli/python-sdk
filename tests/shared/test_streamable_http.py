@@ -694,6 +694,22 @@ async def test_transport_reports_stream_closure_when_host_exits_without_terminat
 
 
 @pytest.mark.anyio
+async def test_notification_to_transport_whose_streams_closed_is_acknowledged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A notification that reaches a transport after its streams closed is answered 202 alone: the
+    failed hand-off must not send a second (500) response after the 202 has completed."""
+    transport = StreamableHTTPServerTransport(mcp_session_id="valid-id")
+    async with transport.connect():
+        pass
+
+    caplog.clear()
+    caplog.set_level(logging.ERROR, logger="mcp.server.streamable_http")
+    assert await _post_to_transport(transport, {"jsonrpc": "2.0", "method": "notifications/initialized"}) == 202
+    assert [record.getMessage() for record in caplog.records if record.levelno == logging.ERROR] == []
+
+
+@pytest.mark.anyio
 async def test_session_termination(basic_app: Starlette) -> None:
     """DELETE terminates the session, after which requests for it return 404."""
     async with make_client(basic_app) as client:

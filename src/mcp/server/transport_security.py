@@ -93,7 +93,7 @@ class TransportSecurityMiddleware:
 
     def _validate_content_type(self, content_type: str | None) -> bool:
         """Validate the Content-Type header for POST requests."""
-        return content_type is not None and content_type.lower().startswith("application/json")
+        return content_type is not None and content_type.split(";")[0].strip().lower() == "application/json"
 
     async def validate_request(self, request: Request, is_post: bool = False) -> Response | None:
         """Validate request headers for DNS rebinding protection.

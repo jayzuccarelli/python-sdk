@@ -78,6 +78,9 @@ async def test_validate_request_defaults_to_protection_disabled() -> None:
         pytest.param("application/json; charset=utf-8", None, id="json-with-charset"),
         pytest.param("APPLICATION/JSON", None, id="case-insensitive"),
         pytest.param("text/plain", 400, id="wrong-type"),
+        pytest.param("application/jsonx", 400, id="json-prefix"),
+        pytest.param("application/json, text/plain", 400, id="json-then-other-type"),
+        pytest.param("text/plain, application/json", 400, id="other-type-then-json"),
         pytest.param(None, 400, id="missing"),
     ],
 )
